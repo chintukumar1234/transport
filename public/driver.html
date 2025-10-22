@@ -1,0 +1,213 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+  <meta name="theme-color" content="#0078ff" />
+  <title>Driver - Live Location Tracker</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet/dist/leaflet.css" />
+  <link rel="stylesheet" href="https://unpkg.com/leaflet-routing-machine@latest/dist/leaflet-routing-machine.css" />
+  <style>
+    body, html { margin: 0; padding: 0; height: 100%; font-family: Poppins, Arial; }
+    #map { height: 100vh; }
+    .sidebar {
+      position: absolute;
+      top: 10px;
+      left: 10px;
+      width: 40%;
+      max-height: 90vh;
+      background-color: rgba(34,34,34,0.95);
+      color: white;
+      padding: 15px;
+      border-radius: 12px;
+      overflow-y: auto;
+      transition: transform 0.3s ease;
+      z-index: 1000;
+    }
+    .sidebar.closed { transform: translateX(-102%); }
+
+    .sidebar h3 { font-size: 18px; margin-bottom: 10px; text-align:center; }
+    .menu-item { padding: 10px; cursor: pointer; border-radius: 6px; display: flex; justify-content: space-between; align-items: center; margin-bottom: 4px; background: #333; transition: background 0.2s; }
+    .menu-item:hover { background: #444; }
+    .submenu { display: none; flex-direction: column; margin-left: 10px; }
+    .menu-item.open + .submenu { display: flex; }
+    .submenu a, .submenu button, .submenu p { padding: 6px 10px; color: #ccc; font-size: 14px; margin-bottom: 2px; text-decoration: none; border-radius: 6px; background: #222; border: none; }
+    .submenu a:hover, .submenu button:hover { background: #555; color: #fff; }
+
+    .toggle-btn {
+      position: absolute;
+      width:70px;
+      top: 6px;
+      left: 43px;
+      background: #222;
+      color: white;
+      border: none;
+      cursor: pointer;
+      padding: 14px 10px;
+      font-size: 20px;
+      border-radius: 8px;
+      z-index: 1100;
+      transition: background 0.3s;
+    }
+    .toggle-btn:hover { background: #444; }
+    #info {
+      position: absolute; top: 10px; left: 50%; transform: translateX(-50%);
+      background: rgba(255, 255, 255, 0.95); padding: 12px 16px; border-radius: 10px;
+      box-shadow: 0 2px 8px rgba(0,0,0,0.3); z-index: 1000; width: 90%; max-width: 340px;
+      text-align: center;
+    }
+    button {
+      font-size: 16px; padding: 10px 16px; border-radius: 8px; border: none;
+      background: #0078ff; color: white; cursor: pointer; width: 100%; margin-top: 8px;
+    }
+    button:hover { background: #005fcc; }
+     @media (max-width:480px) {
+      #info { padding:10px; }
+      .sidebar{
+        width: 310px;
+      }
+      .sidebar.closed { transform: translateX(-350px); }
+    }
+  </style>
+</head>
+<body>
+  
+  <button class="toggle-btn" id="toggleBtn">☰</button>
+  <div class="sidebar closed" id="sidebar">
+    <h3>🚗 Driver Tracker</h3>
+    <p>Status: <span id="status">Not sharing</span></p>
+    <p>Speed: <span id="speed">0</span> km/h</p>
+    <p>Accuracy: <span id="accuracy">-</span> m</p>
+    <p>Last Updated: <span id="time">-</span></p>
+    <button id="toggleShare">Start Sharing</button>
+    <button id="toggleCenter">Auto-Center: ON</button>
+    <div class="submenu">
+    
+    </div>
+    </div>
+  </div>
+  <div id="map"></div>
+
+  <script src="https://unpkg.com/leaflet/dist/leaflet.js"></script>
+  <script src="https://unpkg.com/leaflet-routing-machine@latest/dist/leaflet-routing-machine.js"></script>
+  <script src="https://cdn.socket.io/4.8.1/socket.io.min.js"></script>
+
+  <script>
+    const sidebar = document.getElementById("sidebar");
+    const toggleBtn = document.getElementById("toggleBtn");
+
+    toggleBtn.addEventListener("click", () => {
+      sidebar.classList.toggle("closed");
+      toggleBtn.textContent = sidebar.classList.contains("closed") ? "☰" : "✖";
+    });
+
+    document.querySelectorAll(".menu-btn").forEach(button => {
+      button.addEventListener("click", () => { button.classList.toggle("open"); });
+    });
+    const socket = io({ reconnection: true, transports: ["websocket", "polling"] });
+
+    const map = L.map("map").setView([0, 0], 13);
+    L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
+      attribution: '© OpenStreetMap contributors'
+    }).addTo(map);
+
+    const statusEl = document.getElementById("status");
+    const speedEl = document.getElementById("speed");
+    const accuracyEl = document.getElementById("accuracy");
+    const timeEl = document.getElementById("time");
+    const shareBtn = document.getElementById("toggleShare");
+    const centerBtn = document.getElementById("toggleCenter");
+
+    let sharing = false, autoCenter = true;
+    let watchId = null;
+    let driverMarker = null
+    let riderMarker = null;
+    let routeControl = null;
+    let bookedRiderId = null;
+
+    const geoOpts = { enableHighAccuracy: true, timeout: 10000, maximumAge: 1000 };
+    const kmh = (s) => s ? (s * 3.6).toFixed(1) : 0;
+
+    shareBtn.onclick = () => sharing ? stopSharing() : startSharing();
+    centerBtn.onclick = () => { autoCenter = !autoCenter; centerBtn.textContent = `Auto-Center: ${autoCenter ? "ON" : "OFF"}`; };
+
+    function startSharing() {
+      if (!navigator.geolocation) return alert("Geolocation not supported");
+      sharing = true;
+      statusEl.textContent = "Sharing";
+      statusEl.style.color = "green";
+      shareBtn.textContent = "Stop Sharing";
+
+      watchId = navigator.geolocation.watchPosition((pos) => {
+        const { latitude, longitude, speed, accuracy } = pos.coords;
+        const ts = new Date();
+
+        socket.emit("driverLocation", { lat: latitude, lng: longitude, speed, accuracy });
+
+        if (!driverMarker)
+          driverMarker = L.marker([latitude, longitude]).addTo(map).bindPopup("You (Driver)");
+        else driverMarker.setLatLng([latitude, longitude]);
+
+        if (autoCenter) map.setView([latitude, longitude]);
+
+        speedEl.textContent = kmh(speed);
+        accuracyEl.textContent = accuracy ? accuracy.toFixed(1) : "-";
+        timeEl.textContent = ts.toLocaleTimeString();
+
+        if (bookedRiderId && riderMarker)
+          updateRouteToRider();
+      }, (err) => alert("GPS error: " + err.message), geoOpts);
+    }
+
+    function stopSharing() {
+      sharing = false;
+      statusEl.textContent = "Not sharing";
+      statusEl.style.color = "red";
+      shareBtn.textContent = "Start Sharing";
+      if (watchId) navigator.geolocation.clearWatch(watchId);
+    }
+
+    socket.on("bookingConfirmed", ({ riderId, lat, lng }) => {
+      bookedRiderId = riderId;
+      alert("🚖 Booking confirmed! Rider connected.");
+
+      riderMarker = L.marker([lat, lng], { 
+        icon: L.icon({
+          iconUrl: "https://cdn-icons-png.flaticon.com/512/3448/3448339.png",
+          iconSize: [36, 36]
+        }) 
+      }).addTo(map).bindPopup("Rider");
+
+      updateRouteToRider();
+    });
+
+    socket.on("riderPositionUpdate", ({ riderId, lat, lng }) => {
+      if (riderId === bookedRiderId && riderMarker) {
+        riderMarker.setLatLng([lat, lng]);
+        updateRouteToRider();
+      }
+    });
+
+    function updateRouteToRider() {
+      if (!driverMarker || !riderMarker) return;
+      const driverPos = driverMarker.getLatLng();
+      const riderPos = riderMarker.getLatLng();
+
+      // Remove old route if exists
+      if (routeControl) map.removeControl(routeControl);
+
+      // Draw new route following actual roads
+      routeControl = L.Routing.control({
+        waypoints: [L.latLng(driverPos.lat, driverPos.lng), L.latLng(riderPos.lat, riderPos.lng)],
+        routeWhileDragging: false,
+        addWaypoints: false,
+        draggableWaypoints: false,
+        lineOptions: {
+          styles: [{ color: "green", opacity: 0.9, weight: 5 }]
+        },
+        createMarker: () => null // prevent default markers
+      }).addTo(map);
+    }
+  </script>
+</body>
+</html>

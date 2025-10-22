@@ -1,0 +1,289 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+  <meta name="theme-color" content="#0078ff" />
+  <title>Rider - Book & Track Cab</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet/dist/leaflet.css" />
+  <style>
+    html,body { height:100%; margin:0; padding:0; font-family:"Poppins", Arial, sans-serif; background:#f7f9fc; }
+    #map { height:100vh; width:100%; }
+    .sidebar {
+      position: absolute;
+      top: 10px;
+      left: 10px;
+      width: 40%;
+      max-height: 90vh;
+      background-color: rgba(34,34,34,0.95);
+      color: white;
+      padding: 15px;
+      border-radius: 12px;
+      overflow-y: auto;
+      transition: transform 0.3s ease;
+      z-index: 1000;
+    }
+    .sidebar.closed { transform: translateX(-102%); }
+
+    .sidebar h3 { font-size: 18px; margin-bottom: 10px; text-align:center; }
+    .menu-item { padding: 10px; cursor: pointer; border-radius: 6px; display: flex; justify-content: space-between; align-items: center; margin-bottom: 4px; background: #333; transition: background 0.2s; }
+    .menu-item:hover { background: #444; }
+    .submenu { display: none; flex-direction: column; margin-left: 10px; }
+    .menu-item.open + .submenu { display: flex; }
+    .submenu a, .submenu button, .submenu p { padding: 6px 10px; color: #ccc; font-size: 14px; margin-bottom: 2px; text-decoration: none; border-radius: 6px; background: #222; border: none; }
+    .submenu a:hover, .submenu button:hover { background: #555; color: #fff; }
+
+    .toggle-btn {
+      position: absolute;
+      top: 10px;
+      left: 10px;
+      background: #222;
+      color: white;
+      border: none;
+      cursor: pointer;
+      padding: 15px 23px;
+      font-size: 20px;
+      border-radius: 8px;
+      z-index: 1100;
+      transition: background 0.3s;
+    }
+    .toggle-btn:hover { background: #444; }
+
+    #drivers { max-height: 150px; overflow-y: auto; margin-top: 5px; }
+    #info {
+      position: absolute;
+      top: 10px; left: 50%;
+      transform: translateX(-50%);
+      z-index:1000;
+      width:92%; max-width:380px;
+      background: rgba(255,255,255,0.96);
+      padding:12px 14px;
+      border-radius:12px;
+      box-shadow:0 6px 18px rgba(0,0,0,0.12);
+      text-align:left;
+    }
+    #info h3 { margin:0 0 6px 0; font-size:18px; text-align:center;}
+    #info p { margin:6px 0; font-size:14px; }
+    #drivers { margin-top:10px; max-height:140px; overflow:auto; border-top:1px dashed #e8eaf0; padding-top:8px; }
+    .driverItem { padding:8px 6px; border-bottom:1px solid #eee; display:flex; justify-content:space-between; align-items:center; gap:8px; }
+    .driverItem button { padding:6px 8px; border-radius:8px; border:none; cursor:pointer; background:#0078ff; color:white; }
+    .small { font-size:13px; color:hsl(0, 0%, 33%); }
+    #centerBtn { margin-top:8px; width:100%; padding:10px; border-radius:8px; border:none; background:#413636; border:1px solid #ee0886; cursor:pointer; }
+    @media (max-width:480px) {
+      .driverItem { font-size:15px; }
+      #info { padding:10px; }
+      .sidebar{
+        width: 310px;
+      }
+      .sidebar.closed { transform: translateX(-350px); }
+    }
+  </style>
+</head>
+<body>
+  <button class="toggle-btn" id="toggleBtn">☰</button>
+  <div class="sidebar closed" id="sidebar">
+    <h3>🚖 Rider Menu</h3>
+    <div class="menu-item menu-btn">Rider Controls <span>▼</span></div>
+    <div class="submenu">
+      <button id="centerBtn">Auto-Center: ON</button>
+      <p>Status: <span id="status">Idle</span></p>
+      <p>Speed: <span id="speed">0</span> km/h — Accuracy: <span id="accuracy">-</span> m</p>
+      <p>Last update: <span id="time">-</span></p>
+    </div>
+
+    <div class="menu-item menu-btn">Nearby Drivers <span>▼</span></div>
+    <div class="submenu" id="drivers">
+      <div class="small">Searching for drivers…</div>
+    </div>
+  </div>
+
+  <div id="map"></div>
+
+  <script src="https://unpkg.com/leaflet/dist/leaflet.js"></script>
+  <script src="https://cdn.socket.io/4.8.1/socket.io.min.js" crossorigin="anonymous"></script>
+  <script>
+    const sidebar = document.getElementById("sidebar");
+    const toggleBtn = document.getElementById("toggleBtn");
+
+    toggleBtn.addEventListener("click", () => {
+      sidebar.classList.toggle("closed");
+      toggleBtn.textContent = sidebar.classList.contains("closed") ? "☰" : "✖";
+    });
+
+    document.querySelectorAll(".menu-btn").forEach(button => {
+      button.addEventListener("click", () => { button.classList.toggle("open"); });
+    });
+    const socket = io({ reconnection: true, reconnectionAttempts: Infinity, transports: ['websocket','polling'] });
+
+    const map = L.map('map', { zoomControl: false }).setView([0,0], 13);
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png').addTo(map);
+
+    // UI
+    const statusEl = document.getElementById('status');
+    const speedEl = document.getElementById('speed');
+    const accuracyEl = document.getElementById('accuracy');
+    const timeEl = document.getElementById('time');
+    const driversEl = document.getElementById('drivers');
+    const centerBtn = document.getElementById('centerBtn');
+
+    // State
+    let riderMarker = null;
+    let driverMarkers = {};   // id -> marker
+    let bookedDriver = null;
+    let routeLine = null;
+    let autoCenter = true;
+    let lastRiderPos = null;
+
+    const geoOpts = { enableHighAccuracy:true, timeout:10000, maximumAge:1000 };
+
+    centerBtn.addEventListener('click', () => {
+      autoCenter = !autoCenter;
+      centerBtn.textContent = `Auto-Center: ${autoCenter ? 'ON' : 'OFF'}`;
+    });
+
+    // Helpers
+    function formatTime(d){ return new Date(d).toLocaleTimeString(); }
+    function getDistanceKm(lat1,lon1,lat2,lon2){
+      const R = 6371;
+      const dLat = (lat2-lat1) * Math.PI/180;
+      const dLon = (lon2-lon1) * Math.PI/180;
+      const a = Math.sin(dLat/2)**2 + Math.cos(lat1*Math.PI/180)*Math.cos(lat2*Math.PI/180)*Math.sin(dLon/2)**2;
+      return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+    }
+
+    // Track rider
+    if(navigator.geolocation){
+      navigator.geolocation.watchPosition((pos) => {
+        const { latitude:lat, longitude:lng, speed, accuracy } = pos.coords;
+        const ts = pos.timestamp || Date.now();
+        lastRiderPos = [lat, lng];
+
+        // Emit to server
+        socket.emit('riderLocation', { lat, lng, speed, accuracy, ts });
+
+        // Map marker
+        if(!riderMarker){
+          riderMarker = L.marker([lat,lng]).addTo(map).bindPopup('You (Rider)').openPopup();
+        } else {
+          riderMarker.setLatLng([lat,lng]);
+        }
+
+        if(autoCenter) map.setView([lat,lng], 15);
+
+        // UI updates
+        speedEl.textContent = speed ? (speed*3.6).toFixed(1) : 0;
+        accuracyEl.textContent = accuracy ? accuracy.toFixed(1) : '-';
+        timeEl.textContent = formatTime(ts);
+      }, (err) => alert('Location error: ' + err.message), geoOpts);
+    } else {
+      alert('Geolocation not supported');
+    }
+
+    // Receive drivers list and draw them
+    socket.on('updateDrivers', (drivers) => {
+      driversEl.innerHTML = ''; // reset list
+
+      // drivers is expected: { id1: {lat, lng, bookedBy}, id2: {...} }
+      for(const id in drivers){
+        const d = drivers[id];
+        // marker
+        if(!driverMarkers[id]){
+          const icon = L.icon({
+            iconUrl: 'https://cdn-icons-png.flaticon.com/512/3448/3448339.png',
+            iconSize: [36,36],
+            iconAnchor: [18,18]
+          });
+          const mk = L.marker([d.lat,d.lng], { icon }).addTo(map);
+          mk.on('click', () => tryBookDriver(id));
+          driverMarkers[id] = mk;
+        } else {
+          driverMarkers[id].setLatLng([d.lat,d.lng]);
+        }
+
+        // opacity for booked
+        driverMarkers[id].setOpacity(d.bookedBy ? 0.4 : 1);
+
+        // list UI
+        const item = document.createElement('div');
+        item.className = 'driverItem';
+        const left = document.createElement('div');
+        left.innerHTML = `<div>🚗 Driver: ${id}</div><div class="small">${lastRiderPos ? getDistanceKm(d.lat,d.lng,lastRiderPos[0], lastRiderPos[1]).toFixed(2) + ' km' : ''}</div>`;
+        const btn = document.createElement('button');
+        btn.textContent = d.bookedBy ? 'Booked' : 'Book';
+        btn.disabled = !!d.bookedBy || !!bookedDriver;
+        btn.onclick = (e) => { e.stopPropagation(); if(!d.bookedBy) tryBookDriver(id); };
+        item.appendChild(left);
+        item.appendChild(btn);
+        driversEl.appendChild(item);
+      }
+
+      if(Object.keys(drivers).length === 0){
+        driversEl.innerHTML = '<div class="small">No drivers available nearby</div>';
+      }
+    });
+
+    function tryBookDriver(driverId){
+      if(bookedDriver){
+        alert('You already have a booked driver.');
+        return;
+      }
+      if(confirm('Book driver ' + driverId + '?')){
+        socket.emit('bookDriver', driverId);
+      }
+    }
+
+    // Booking success/failure
+    socket.on('bookingSuccess', ({ driverId }) => {
+      bookedDriver = driverId;
+      statusEl.textContent = `Booked driver ${driverId} — tracking...`;
+      statusEl.style.color = 'green';
+      alert('✅ Driver booked: ' + driverId);
+    });
+
+    socket.on('bookingFailed', (msg) => {
+      alert('Booking failed: ' + msg);
+    });
+
+    // Driver position updates for booked driver
+    socket.on('driverPositionUpdate', ({ driverId, lat, lng }) => {
+      // Update corresponding marker
+      if(driverMarkers[driverId]){
+        driverMarkers[driverId].setLatLng([lat,lng]);
+      }
+
+      // If this is our booked driver, update route line and ETA
+      if(bookedDriver === driverId && riderMarker){
+        const riderPos = riderMarker.getLatLng();
+        const driverPos = L.latLng(lat, lng);
+
+        // routeLine between driver and rider
+        if(!routeLine){
+          routeLine = L.polyline([driverPos, riderPos], { color:'#2a7cff', weight:4 }).addTo(map);
+        } else {
+          routeLine.setLatLngs([driverPos, riderPos]);
+        }
+
+        // distance & ETA (very rough)
+        const distance = getDistanceKm(driverPos.lat, driverPos.lng, riderPos.lat, riderPos.lng);
+        // assume avg 30 km/h => 0.5 km/min
+        const etaMin = Math.max(1, Math.round((distance / 0.5)));
+        statusEl.textContent = `Driver ${driverId} — ${distance.toFixed(2)} km away (ETA ${etaMin} min)`;
+
+        // optional: keep both in view
+        if(autoCenter){
+          const bounds = L.latLngBounds([driverPos, riderPos]);
+          map.fitBounds(bounds, { padding: [50,50] });
+        }
+      }
+    });
+
+    // Optional: server may send bookingConfirmed for driver page; handle here too
+    socket.on('bookingConfirmed', ({ driverId }) => {
+      if(bookedDriver === driverId) alert('✅ Driver confirmed booking with you.');
+    });
+
+    socket.on('connect', () => console.log('Socket connected'));
+    socket.on('disconnect', () => console.log('Socket disconnected'));
+  </script>
+</body>
+</html>
